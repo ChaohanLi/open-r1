@@ -41,6 +41,9 @@ class ProteinLLMModel(PreTrainedModel):
         self.protein_model_name = protein_model_name
         self.text_model_finetune = text_model_finetune
         self.protein_model_finetune = protein_model_finetune
+
+        self.name_or_path = config.text_model_name
+        self.config.name_or_path = config.text_model_name
         
         # 加载文本模型
         print(f"Loading text model: {text_model_name}")

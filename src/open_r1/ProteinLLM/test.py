@@ -194,7 +194,8 @@ def test_sft_trainer():
         logging_steps=1,
         save_steps=100,
         gradient_checkpointing=False,  # 先关闭，避免复杂性
-        fp16=True,
+        fp16=False,  # 🔧 关闭FP16，避免梯度缩放问题
+        bf16=False,  # 🔧 也关闭bf16
         remove_unused_columns=False,  # 🔧 重要：保留protein_sequence列
         dataloader_drop_last=False,
     )

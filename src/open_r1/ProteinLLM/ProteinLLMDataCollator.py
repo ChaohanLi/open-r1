@@ -23,37 +23,29 @@ class ProteinLLMDataCollator:
         self.max_length_protein = max_length_protein
     
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """
-        处理batch数据
+        """处理batch数据"""
+        print(f"DataCollator received {len(features)} features")
         
-        Args:
-            features: TRL传入的特征列表，每个feature包含：
-                - text: 格式化后的对话文本（TRL已处理）
-                - protein_sequence: 蛋白质序列字符串（原始数据保留）
-                
-        Returns:
-            batch: 模型期望的输入格式
-                - input_ids: 文本token IDs
-                - attention_mask: 文本attention mask
-                - labels: 训练标签
-                - protein_tokenized: 蛋白质tokenization结果
-                - batch_idx_map: 蛋白质到batch的映射
-        """
-        
-        # 🔧 步骤1：提取数据
+        # 提取数据
         texts = []
         protein_sequences = []
         
-        for feature in features:
-            # 提取TRL格式化的文本
+        for i, feature in enumerate(features):
+            # 提取文本
             if "text" in feature:
                 texts.append(feature["text"])
+            elif "messages" in feature:
+                text = self.tokenizer.apply_chat_template(
+                    feature["messages"], 
+                    tokenize=False, 
+                    add_generation_prompt=False
+                )
+                texts.append(text)
             else:
-                raise ValueError("DataCollator expects 'text' field from TRL processing")
+                raise ValueError(f"Feature {i} missing 'text' or 'messages' field")
             
             # 提取蛋白质序列
             if "protein_sequence" in feature:
-                # 确保是字符串格式
                 protein_seq = feature["protein_sequence"]
                 if isinstance(protein_seq, list) and len(protein_seq) == 1:
                     protein_seq = protein_seq[0]
@@ -61,42 +53,42 @@ class ProteinLLMDataCollator:
                     raise ValueError(f"Expected 1 protein sequence per sample, got {len(protein_seq)}")
                 protein_sequences.append(protein_seq)
             else:
-                # 没有蛋白质序列，使用占位符
+                print(f"Warning: Feature {i} missing 'protein_sequence', using empty string")
                 protein_sequences.append("")
         
-        # 🔧 步骤2：使用你的Processor处理双模态数据
+        # 🔧 修复：使用Processor处理，避免参数冲突
         try:
-            # 转换为Processor期望的格式
             batch_protein_sequences = [[seq] for seq in protein_sequences if seq]
             
             if batch_protein_sequences:
-                # 有蛋白质序列的情况
+                print(f"Processing {len(batch_protein_sequences)} protein sequences")
+                # 🔧 关键修复：不传递额外的kwargs，避免参数冲突
                 batch = self.processor(
                     batch_protein_sequences=batch_protein_sequences,
                     text=texts,
                     max_length_text=self.max_length_text,
                     max_length_protein=self.max_length_protein,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True
+                    return_tensors="pt"
+                    # 🔧 移除padding和truncation参数，让processor内部处理
                 )
             else:
-                # 纯文本情况（备选方案）
-                batch = self.processor.tokenizer(
+                print("No protein sequences found, using text-only processing")
+                # 🔧 纯文本处理也要避免参数冲突
+                batch = self.tokenizer(
                     texts,
                     max_length=self.max_length_text,
                     return_tensors="pt",
-                    padding=True,
+                    padding=True,  # 只在这里指定一次
                     truncation=True
                 )
-                # 添加空的蛋白质信息
                 batch["protein_tokenized"] = None
                 batch["batch_idx_map"] = []
                 
         except Exception as e:
             print(f"Processor error: {e}")
-            # 降级处理：纯文本
-            batch = self.processor.tokenizer(
+            print("Falling back to text-only processing")
+            # 🔧 降级处理
+            batch = self.tokenizer(
                 texts,
                 max_length=self.max_length_text,
                 return_tensors="pt",
@@ -106,12 +98,15 @@ class ProteinLLMDataCollator:
             batch["protein_tokenized"] = None
             batch["batch_idx_map"] = []
         
-        # 🔧 步骤3：添加训练标签
+        # 添加训练标签
         batch["labels"] = batch["input_ids"].clone()
         
-        # 🔧 步骤4：确保batch字典格式正确
+        # 确保batch是字典格式
         if not isinstance(batch, dict):
             batch = dict(batch)
+        
+        print(f"DataCollator output keys: {batch.keys()}")
+        print(f"Batch input_ids shape: {batch['input_ids'].shape}")
         
         return batch
 
