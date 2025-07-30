@@ -21,6 +21,9 @@ sys.path.append('/home/cl426/data/open-r1/src')
 from open_r1.ProteinLLM.ProteinLLMModel import ProteinLLMModel, ProteinLLMConfig
 from open_r1.ProteinLLM.ProteinLLMProcessor import ProteinLLMProcessor
 
+    # 🔧 导入自定义DataCollator
+from open_r1.ProteinLLM.ProteinLLMDataCollator import ProteinLLMDataCollator
+
 # 🔧 修复：使用你的真实数据
 def load_real_data():
     """加载你的实际数据"""
@@ -172,9 +175,7 @@ def test_sft_trainer():
         protein_model_name="facebook/esm2_t12_35M_UR50D"
     )
     model = ProteinLLMModel(config=config)
-    
-    # 🔧 导入自定义DataCollator
-    from open_r1.ProteinLLM.ProteinDataCollator import ProteinLLMDataCollator
+
     
     # 创建数据收集器
     data_collator = ProteinLLMDataCollator(
