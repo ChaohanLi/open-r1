@@ -49,6 +49,7 @@ class ProteinLLMModel(PreTrainedModel):
             cache_dir=cache_dir,
             trust_remote_code=True,
             torch_dtype=torch.float16,
+            attn_implementation="eager",
             **kwargs
         )
         
@@ -58,6 +59,8 @@ class ProteinLLMModel(PreTrainedModel):
             trust_remote_code=True
         )
         
+        self.config.tokenizer = self.text_tokenizer
+
         # 添加蛋白质特殊token（Model的职责）
         protein_tokens = ["<|protein_pad|>"]
         num_added = self.text_tokenizer.add_special_tokens({
@@ -128,25 +131,36 @@ class ProteinLLMModel(PreTrainedModel):
         protein_tokenized: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """
-        编码蛋白质序列 - 修复ESM特殊token问题
+        使用ESM2获取逐氨基酸表示 - 修正版本
+        
+        ESM2结构：
+        - EsmForMaskedLM.esm (基础编码器)
+        - EsmForMaskedLM.esm.embeddings
+        - EsmForMaskedLM.esm.encoder
+        - EsmForMaskedLM.lm_head (MLM头，我们不需要)
         """
         with torch.set_grad_enabled(self.protein_model_finetune):
-            protein_outputs = self.protein_model(
+            # 🔧 修正：使用ESM2的基础编码器获取逐氨基酸表示
+            # 直接调用esm编码器，避免MaskedLM的复杂性
+            esm_base_model = self.protein_model.esm  # 获取基础ESM编码器
+            
+            # 获取逐氨基酸的表示
+            protein_outputs = esm_base_model(
                 input_ids=protein_tokenized["input_ids"],
                 attention_mask=protein_tokenized["attention_mask"],
-                output_hidden_states=True
+                return_dict=True
             )
             
-            # 使用最后一层的hidden states
-            protein_embeddings = protein_outputs.last_hidden_state
+            # 现在可以获取last_hidden_state了
+            protein_embeddings = protein_outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
             
-            # 🔧 修复：移除ESM的<cls>和<eos> token embeddings
-            # ESM格式：[<cls>, protein_tokens..., <eos>]
-            # 我们只要中间的蛋白质tokens
-            if protein_embeddings.size(1) > 2:  # 确保有足够的tokens
-                protein_embeddings = protein_embeddings[:, 1:-1, :]  # 移除首尾的特殊tokens
+            # 🔧 移除ESM的特殊tokens：<cls> (pos 0) 和 <eos> (pos -1)
+            # ESM tokenizer格式：[<cls>, AA1, AA2, ..., AAn, <eos>]
+            # 我们只要中间的氨基酸表示：[AA1, AA2, ..., AAn]
+            if protein_embeddings.size(1) > 2:  # 确保序列长度足够
+                protein_embeddings = protein_embeddings[:, 1:-1, :]  # 移除首尾特殊tokens
             
-            # 应用投影层
+            # 应用投影层：ESM hidden_size -> Text hidden_size
             protein_embeddings = self.protein_projection(protein_embeddings)
             
             return protein_embeddings
@@ -159,7 +173,7 @@ class ProteinLLMModel(PreTrainedModel):
         batch_idx_map: List[int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        简化的融合逻辑 - 修复token数量计算
+        严格的融合逻辑 - 占位符数量必须匹配氨基酸数量
         """
         batch_size, text_seq_len = input_ids.shape
         
@@ -171,21 +185,48 @@ class ProteinLLMModel(PreTrainedModel):
         protein_positions = (input_ids == self.protein_token_id)
         
         if protein_embeddings is not None and protein_positions.any():
+            protein_idx = 0
+            
             for batch_idx in range(batch_size):
                 batch_protein_positions = protein_positions[batch_idx].nonzero(as_tuple=True)[0]
                 
                 if len(batch_protein_positions) > 0:
-                    # 当前样本的蛋白质embedding
-                    protein_embed = protein_embeddings[batch_idx]  # [actual_protein_seq_len, hidden_size]
+                    # 🔧 添加：检查batch_idx_map范围
+                    if protein_idx >= len(batch_idx_map):
+                        raise ValueError(
+                            f"protein_idx ({protein_idx}) exceeds batch_idx_map length ({len(batch_idx_map)}). "
+                            f"This indicates a mismatch between protein sequences and batch samples."
+                        )
                     
-                    # 🔧 修复：正确计算有效token数量（已经移除了<cls>和<eos>）
-                    # 现在protein_embed已经是纯蛋白质序列的embedding
-                    valid_mask = protein_embed.norm(dim=-1) > 0
-                    if valid_mask.any():
-                        avg_protein_embed = protein_embed[valid_mask].mean(dim=0)
-                        # 替换所有占位符位置
-                        for pos in batch_protein_positions:
-                            fused_embeddings[batch_idx, pos] = avg_protein_embed
+                    if batch_idx_map[protein_idx] == batch_idx:
+                        # 当前样本的蛋白质embedding
+                        protein_embed = protein_embeddings[protein_idx]  # [actual_protein_seq_len, hidden_size]
+                        
+                        # 计算有效氨基酸数量（已经移除了<cls>和<eos>）
+                        valid_mask = protein_embed.norm(dim=-1) > 0
+                        valid_aa_count = valid_mask.sum().item()
+                        num_placeholders = len(batch_protein_positions)
+                        
+                        # 🔧 严格检查：占位符数量必须等于氨基酸数量
+                        if num_placeholders != valid_aa_count:
+                            raise ValueError(
+                                f"Mismatch in batch {batch_idx}: "
+                                f"Found {num_placeholders} <|protein_pad|> placeholders in text, "
+                                f"but protein has {valid_aa_count} valid amino acids. "
+                                f"Processor should ensure these numbers match exactly.\n"
+                                f"Protein sequence length after removing <cls>/<eos>: {protein_embed.shape[0]}\n"
+                                f"Valid amino acids (non-zero norm): {valid_aa_count}\n"
+                                f"Placeholder positions: {batch_protein_positions.tolist()}"
+                            )
+                        
+                        if valid_aa_count > 0:
+                            valid_aa_embeddings = protein_embed[valid_mask]
+                            
+                            # 🔧 逐个精确替换（数量已经验证匹配）
+                            for i, pos in enumerate(batch_protein_positions):
+                                fused_embeddings[batch_idx, pos] = valid_aa_embeddings[i]
+                        
+                        protein_idx += 1
         
         return fused_embeddings, attention_mask
     

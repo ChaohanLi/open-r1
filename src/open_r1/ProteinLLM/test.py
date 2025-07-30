@@ -1,12 +1,22 @@
 import os
 import sys
+
+# 🔧 在任何transformers导入之前设置环境变量
+os.environ["FLASH_ATTENTION_ENABLE"] = "FALSE"
+os.environ["FLASH_ATTENTION_ENABLED"] = "0"
+os.environ["DISABLE_FLASH_ATTN"] = "1"
+os.environ["FLASH_ATTN_ENABLE"] = "FALSE"
+
+# 🔧 强制transformers使用eager attention
+os.environ["TRANSFORMERS_ATTENTION_TYPE"] = "eager"
+
 import torch
 import json
 from datasets import Dataset
 from transformers import TrainingArguments
 
 # 添加项目路径
-sys.path.append('/home/x-cli32/chaohan/projects/open-r1/src')
+sys.path.append('/home/cl426/data/open-r1/src')
 
 from open_r1.ProteinLLM.ProteinLLMModel import ProteinLLMModel, ProteinLLMConfig
 from open_r1.ProteinLLM.ProteinLLMProcessor import ProteinLLMProcessor
@@ -14,7 +24,7 @@ from open_r1.ProteinLLM.ProteinLLMProcessor import ProteinLLMProcessor
 # 🔧 修复：使用你的真实数据
 def load_real_data():
     """加载你的实际数据"""
-    data_path = "/home/x-cli32/chaohan/projects/open-r1/src/open_r1/ProteinLLM/data.jsonl"
+    data_path = "/home/cl426/data/open-r1/src/open_r1/ProteinLLM/data.jsonl"
     
     samples = []
     with open(data_path, 'r') as f:
@@ -146,85 +156,57 @@ def test_forward_pass(model, processor):
     return batch_inputs, outputs
 
 def test_sft_trainer():
-    """测试SFTTrainer集成"""
+    """测试SFTTrainer集成 - 使用自定义DataCollator"""
     print("=== Testing SFTTrainer Integration ===")
     
-    # 🔧 使用你的真实数据
+    # 加载真实数据
     real_data = load_real_data()
     dataset = Dataset.from_list(real_data)
     
     print(f"Dataset size: {len(dataset)}")
     print(f"Sample keys: {dataset[0].keys()}")
     
-    # 创建模型（使用小模型）
+    # 创建模型
     config = ProteinLLMConfig(
         text_model_name="Qwen/Qwen2.5-Math-1.5B",
         protein_model_name="facebook/esm2_t12_35M_UR50D"
     )
     model = ProteinLLMModel(config=config)
     
-    # 训练参数（极简测试）
+    # 🔧 导入自定义DataCollator
+    from open_r1.ProteinLLM.ProteinDataCollator import ProteinLLMDataCollator
+    
+    # 创建数据收集器
+    data_collator = ProteinLLMDataCollator(
+        processor=model.processor,
+        tokenizer=model.text_tokenizer,
+        max_length_text=512,
+        max_length_protein=100
+    )
+    
+    # 训练参数
     training_args = TrainingArguments(
         output_dir="./test_output",
-        num_train_epochs=1,
-        per_device_train_batch_size=2,  # 小batch size
+        max_steps=3,
+        per_device_train_batch_size=2,
         learning_rate=1e-5,
         logging_steps=1,
         save_steps=100,
-        max_steps=3,  # 只跑3步验证
+        gradient_checkpointing=False,  # 先关闭，避免复杂性
+        fp16=True,
+        remove_unused_columns=False,  # 🔧 重要：保留protein_sequence列
         dataloader_drop_last=False,
-        remove_unused_columns=False,  # 保留protein_sequence列
-        gradient_checkpointing=True,  # 节省内存
-        fp16=True,  # 使用混合精度
     )
     
-    # 🔧 修复：导入正确的SFTTrainer
-    try:
-        # 尝试从trl导入（如果安装了TRL）
-        from trl import SFTTrainer
-        print("Using TRL SFTTrainer")
-    except ImportError:
-        # 如果没有TRL，使用transformers的简单版本
-        print("TRL not found, creating simple trainer")
-        from transformers import Trainer
-        
-        class SimpleSFTTrainer(Trainer):
-            def __init__(self, processing_class=None, **kwargs):
-                super().__init__(**kwargs)
-                self.processing_class = processing_class
-            
-            def _prepare_dataset(self, dataset, tokenizer=None, packing=None, **kwargs):
-                def process_sample(examples):
-                    # 转换messages为文本
-                    texts = []
-                    for messages in examples["messages"]:
-                        text = self.tokenizer.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=False
-                        )
-                        texts.append(text)
-                    
-                    # 使用processing_class处理
-                    processed = self.processing_class(
-                        batch_protein_sequences=examples["protein_sequence"],
-                        text=texts
-                    )
-                    
-                    # 添加labels（SFT需要）
-                    processed["labels"] = processed["input_ids"].clone()
-                    
-                    return processed
-                
-                return dataset.map(process_sample, batched=True, remove_columns=dataset.column_names)
-        
-        SFTTrainer = SimpleSFTTrainer
+    # 🔧 使用SFTTrainer + 自定义DataCollator
+    from trl import SFTTrainer
     
-    # 创建训练器
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        processing_class=model.processor,
-        tokenizer=model.text_tokenizer,
+        data_collator=data_collator,  # 🔧 关键：使用自定义数据收集器
+        # 🔧 不传processing_class，让DataCollator处理所有数据处理逻辑
     )
     
     print("Starting SFT training test...")

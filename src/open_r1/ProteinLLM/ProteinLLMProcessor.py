@@ -26,6 +26,58 @@ class ProteinLLMProcessor(ProcessorMixin):
         if not hasattr(self.tokenizer, 'pad_token') or self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
     
+    # 🔧 新增：TRL兼容性属性
+    @property
+    def pad_token(self):
+        """TRL期望的pad_token属性"""
+        return self.tokenizer.pad_token
+    
+    @property
+    def eos_token(self):
+        """TRL期望的eos_token属性"""
+        return self.tokenizer.eos_token
+    
+    @property
+    def pad_token_id(self):
+        """TRL期望的pad_token_id属性"""
+        return self.tokenizer.pad_token_id
+    
+    @property
+    def eos_token_id(self):
+        """TRL期望的eos_token_id属性"""
+        return self.tokenizer.eos_token_id
+
+    @property
+    def bos_token(self):
+        """TRL期望的bos_token属性"""
+        return getattr(self.tokenizer, 'bos_token', None)
+    
+    @property
+    def bos_token_id(self):
+        """TRL期望的bos_token_id属性"""
+        return getattr(self.tokenizer, 'bos_token_id', None)
+    
+    # 🔧 TRL期望的方法 - 委托给内部tokenizer
+    def apply_chat_template(self, *args, **kwargs):
+        """委托给内部tokenizer"""
+        return self.tokenizer.apply_chat_template(*args, **kwargs)
+    
+    def convert_tokens_to_ids(self, *args, **kwargs):
+        """委托给内部tokenizer - TRL需要此方法"""
+        return self.tokenizer.convert_tokens_to_ids(*args, **kwargs)
+    
+    def convert_ids_to_tokens(self, *args, **kwargs):
+        """委托给内部tokenizer"""
+        return self.tokenizer.convert_ids_to_tokens(*args, **kwargs)
+    
+    def encode(self, *args, **kwargs):
+        """委托给内部tokenizer"""
+        return self.tokenizer.encode(*args, **kwargs)
+    
+    def __len__(self):
+        """返回tokenizer的词汇表大小"""
+        return len(self.tokenizer)
+
     def __call__(
         self,
         batch_protein_sequences: List[List[str]],
