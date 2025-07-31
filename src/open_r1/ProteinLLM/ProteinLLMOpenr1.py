@@ -8,7 +8,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from datasets import Dataset
 
 from .ProteinLLMModel import ProteinLLMModel, ProteinLLMConfig
-from .ProteinDataCollator import ProteinLLMDataCollator, ProteinLLMDataCollatorForInference
+from .ProteinLLMDataCollator import ProteinLLMDataCollator, ProteinLLMDataCollatorForInference
 
 def get_protein_llm_model(
     text_model_name: str = "Qwen/Qwen2.5-Math-7B",
@@ -39,14 +39,12 @@ def get_protein_data_collator(
     if for_inference:
         return ProteinLLMDataCollatorForInference(
             processor=model.processor,
-            tokenizer=model.text_tokenizer,
             max_length_text=max_length_text,
             max_length_protein=max_length_protein
         )
     else:
         return ProteinLLMDataCollator(
             processor=model.processor,
-            tokenizer=model.text_tokenizer,
             max_length_text=max_length_text,
             max_length_protein=max_length_protein
         )

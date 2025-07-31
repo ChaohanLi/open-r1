@@ -6,8 +6,14 @@ from transformers.tokenization_utils_base import TextInput
 
 class ProteinLLMProcessor(ProcessorMixin):
     """
-    简化的蛋白质处理器 - 专门针对信号肽分类任务
-    假设：每个样本确定包含1个长度70的蛋白质序列
+    蛋白质多模态处理器 - 遵循HuggingFace设计模式
+    
+    职责：
+    1. 使用两种tokenizer分别处理双模态数据
+    2. 计算占位符数量并在文本中挖坑
+    3. 返回处理后的单样本结果
+    
+    注意：不负责batch打包，那是DataCollator的职责
     """
     
     attributes = ["tokenizer", "protein_tokenizer"]
@@ -80,67 +86,77 @@ class ProteinLLMProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        batch_protein_sequences: List[List[str]],
-        text: Union[str, List[str]],
+        text: Union[str, List[str]] = None,
+        protein_sequence: Union[str, List[str]] = None,
         max_length_text: int = 1024,
         max_length_protein: int = 128,
-        return_tensors: str = "pt",
+        return_tensors: Optional[str] = None,
         **kwargs,
     ) -> BatchFeature:
         """
-        简化的处理方法 - 修复ESM token计算
+        处理单个样本或批量样本的双模态数据
+        
+        Args:
+            text: 文本数据（可以是字符串或字符串列表）
+            protein_sequence: 蛋白质序列（字符串或字符串列表）
+            max_length_text: 文本最大长度
+            max_length_protein: 蛋白质最大长度
+            return_tensors: 返回张量格式
+            
+        Returns:
+            BatchFeature: 包含处理后的双模态数据
         """
         
-        # 确保text是列表
+        # 1. 标准化输入格式
         if isinstance(text, str):
             text = [text]
+        if isinstance(protein_sequence, str):
+            protein_sequence = [protein_sequence]
+        
+        if text is None or protein_sequence is None:
+            raise ValueError("Both text and protein_sequence must be provided")
+        
+        if len(text) != len(protein_sequence):
+            raise ValueError(f"Text and protein sequence counts must match: {len(text)} vs {len(protein_sequence)}")
         
         batch_size = len(text)
         
-        # 简化：直接提取蛋白质序列（每个样本1个）
-        protein_sequences = []
-        for sequences in batch_protein_sequences:
-            assert len(sequences) == 1, f"Expected 1 protein per sample, got {len(sequences)}"
-            protein_sequences.append(sequences[0])
+        # 2. 处理蛋白质序列（ESM tokenizer接受字符串列表）
+        print(f"Processing {len(protein_sequence)} protein sequences")
         
-        # 处理蛋白质序列
-        if protein_sequences:
-            protein_tokenized = self.protein_tokenizer(
-                protein_sequences,
-                padding=True,
-                truncation=True,
-                max_length=max_length_protein,
-                return_tensors=return_tensors,
-                return_attention_mask=True,
-            )
-            
-            # 简化的占位符替换：一对一映射
-            processed_text = []
-            for i, txt in enumerate(text):
-                if self.protein_token in txt:
-                    # 🔧 修复：正确计算蛋白质token数量（排除<cls>和<eos>）
-                    attention_mask = protein_tokenized['attention_mask'][i]
-                    total_tokens = attention_mask.sum().item()
-                    
-                    # ESM会添加<cls>和<eos>，所以实际蛋白质token数 = total - 2
-                    protein_token_count = max(1, total_tokens - 2)  # 至少保留1个token
-                    
-                    # 简单替换：一个占位符变成多个
-                    processed_txt = txt.replace(
-                        self.protein_token, 
-                        self.protein_token * protein_token_count
-                    )
-                    processed_text.append(processed_txt)
-                else:
-                    processed_text.append(txt)
-            
-            text = processed_text
-        else:
-            protein_tokenized = None
+        protein_tokenized = self.protein_tokenizer(
+            protein_sequence,  # 直接传入字符串列表
+            padding=True,
+            truncation=True,
+            max_length=max_length_protein,
+            return_tensors=return_tensors,
+            return_attention_mask=True,
+        )
         
-        # 处理文本
-        text_inputs = self.tokenizer(
-            text,
+        # 3. 为每个文本样本挖坑
+        processed_texts = []
+        for i, txt in enumerate(text):
+            if self.protein_token in txt:
+                # 计算该样本的实际氨基酸token数
+                attention_mask = protein_tokenized['attention_mask'][i]
+                total_tokens = attention_mask.sum().item()
+                # ESM格式：[<cls>, AA1, AA2, ..., AAn, <eos>] → 氨基酸数 = total - 2
+                amino_acid_count = max(1, total_tokens - 2)
+                
+                # 挖坑：将1个占位符扩展为对应数量的占位符
+                expanded_text = txt.replace(
+                    self.protein_token, 
+                    self.protein_token * amino_acid_count
+                )
+                processed_texts.append(expanded_text)
+                
+                print(f"Sample {i}: {total_tokens} total tokens → {amino_acid_count} amino acid placeholders")
+            else:
+                processed_texts.append(txt)
+        
+        # 4. 处理文本（使用挖坑后的文本）
+        text_tokenized = self.tokenizer(
+            processed_texts,
             padding=True,
             truncation=True,
             max_length=max_length_text,
@@ -148,12 +164,20 @@ class ProteinLLMProcessor(ProcessorMixin):
             **kwargs
         )
         
-        # 组装结果
-        result = {**text_inputs}
-        if protein_tokenized is not None:
-            result["protein_tokenized"] = protein_tokenized
-            # 简化的batch_idx_map：[0, 1, 2, ...]
-            result["batch_idx_map"] = list(range(batch_size))
+        # 5. 组装结果
+        result = {
+            # 文本tokenization结果
+            **text_tokenized,
+            # 蛋白质tokenization结果
+            "protein_tokenized": {
+                "input_ids": protein_tokenized["input_ids"],
+                "attention_mask": protein_tokenized["attention_mask"],
+            },
+            # 简化的批次映射
+            "batch_idx_map": list(range(batch_size)),
+        }
+        
+        print(f"Processor output - Text: {text_tokenized['input_ids'].shape}, Protein: {protein_tokenized['input_ids'].shape}")
         
         return BatchFeature(data=result)
     

@@ -5,90 +5,85 @@ from datasets import Dataset
 
 class ProteinLLMDataCollator:
     """
-    蛋白质多模态数据收集器
+    蛋白质多模态数据收集器 - 遵循HuggingFace设计模式
     
     职责：
-    1. 接收TRL标准格式数据（包含text和protein_sequence）
-    2. 使用ProteinLLMProcessor处理双模态数据
-    3. 返回模型期望的完整batch格式
+    1. 从原始features提取数据
+    2. 调用Processor进行双模态处理
+    3. 将处理结果打包成训练batch
+    4. 添加训练标签
     
-    工作流程：
-    TRL数据 -> 提取蛋白质序列 -> Processor处理 -> 模型输入格式
+    分工：
+    - Processor: 负责tokenization和挖坑
+    - DataCollator: 负责batch打包和标签生成
     """
     
-    def __init__(self, processor, tokenizer, max_length_text: int = 512, max_length_protein: int = 100):
+    def __init__(self, processor, max_length_text: int = 512, max_length_protein: int = 100):
         self.processor = processor
-        self.tokenizer = tokenizer
         self.max_length_text = max_length_text
         self.max_length_protein = max_length_protein
     
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """处理batch数据"""
+        """
+        将features转换为训练batch
+        
+        Args:
+            features: 原始数据样本列表，每个包含messages和protein_sequence
+            
+        Returns:
+            Dict[str, torch.Tensor]: 训练batch
+        """
         print(f"DataCollator received {len(features)} features")
         
-        # 提取数据
+        # 1. 提取数据
         texts = []
         protein_sequences = []
         
         for i, feature in enumerate(features):
             # 提取文本
             if "text" in feature:
-                texts.append(feature["text"])
+                text = feature["text"]
             elif "messages" in feature:
-                text = self.tokenizer.apply_chat_template(
+                text = self.processor.tokenizer.apply_chat_template(
                     feature["messages"], 
                     tokenize=False, 
                     add_generation_prompt=False
                 )
-                texts.append(text)
             else:
                 raise ValueError(f"Feature {i} missing 'text' or 'messages' field")
             
-            # 提取蛋白质序列
+            # 提取蛋白质序列（现在是字符串格式）
             if "protein_sequence" in feature:
                 protein_seq = feature["protein_sequence"]
-                if isinstance(protein_seq, list) and len(protein_seq) == 1:
-                    protein_seq = protein_seq[0]
-                elif isinstance(protein_seq, list):
-                    raise ValueError(f"Expected 1 protein sequence per sample, got {len(protein_seq)}")
+                
+                # 验证格式和长度
+                if not isinstance(protein_seq, str):
+                    raise ValueError(f"Expected protein_sequence to be string, got {type(protein_seq)}")
+                
+                if len(protein_seq) != 70:
+                    raise ValueError(f"Expected 70 amino acids, got {len(protein_seq)}")
+                
                 protein_sequences.append(protein_seq)
             else:
-                print(f"Warning: Feature {i} missing 'protein_sequence', using empty string")
-                protein_sequences.append("")
-        
-        # 🔧 修复：使用Processor处理，避免参数冲突
-        try:
-            batch_protein_sequences = [[seq] for seq in protein_sequences if seq]
+                raise ValueError(f"Feature {i} missing required 'protein_sequence' field")
             
-            if batch_protein_sequences:
-                print(f"Processing {len(batch_protein_sequences)} protein sequences")
-                # 🔧 关键修复：不传递额外的kwargs，避免参数冲突
-                batch = self.processor(
-                    batch_protein_sequences=batch_protein_sequences,
-                    text=texts,
-                    max_length_text=self.max_length_text,
-                    max_length_protein=self.max_length_protein,
-                    return_tensors="pt"
-                    # 🔧 移除padding和truncation参数，让processor内部处理
-                )
-            else:
-                print("No protein sequences found, using text-only processing")
-                # 🔧 纯文本处理也要避免参数冲突
-                batch = self.tokenizer(
-                    texts,
-                    max_length=self.max_length_text,
-                    return_tensors="pt",
-                    padding=True,  # 只在这里指定一次
-                    truncation=True
-                )
-                batch["protein_tokenized"] = None
-                batch["batch_idx_map"] = []
-                
+            texts.append(text)
+        
+        # 2. 使用Processor处理双模态数据
+        print(f"Using Processor to handle {len(texts)} samples")
+        
+        try:
+            batch = self.processor(
+                text=texts,
+                protein_sequence=protein_sequences,
+                max_length_text=self.max_length_text,
+                max_length_protein=self.max_length_protein,
+                return_tensors="pt"
+            )
         except Exception as e:
             print(f"Processor error: {e}")
-            print("Falling back to text-only processing")
-            # 🔧 降级处理
-            batch = self.tokenizer(
+            # 降级处理：仅处理文本
+            batch = self.processor.tokenizer(
                 texts,
                 max_length=self.max_length_text,
                 return_tensors="pt",
@@ -98,15 +93,18 @@ class ProteinLLMDataCollator:
             batch["protein_tokenized"] = None
             batch["batch_idx_map"] = []
         
-        # 添加训练标签
+        # 3. 添加训练标签
         batch["labels"] = batch["input_ids"].clone()
         
-        # 确保batch是字典格式
+        # 4. 确保batch是字典格式
         if not isinstance(batch, dict):
             batch = dict(batch)
         
         print(f"DataCollator output keys: {batch.keys()}")
-        print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+        if batch.get("input_ids") is not None:
+            print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+        if batch.get("protein_tokenized") is not None:
+            print(f"Batch protein shape: {batch['protein_tokenized']['input_ids'].shape}")
         
         return batch
 
