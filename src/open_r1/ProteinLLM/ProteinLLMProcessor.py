@@ -94,11 +94,11 @@ class ProteinLLMProcessor(ProcessorMixin):
         **kwargs,
     ) -> BatchFeature:
         """
-        处理单个样本或批量样本的双模态数据
+        处理双模态数据 - 蛋白质序列是必需的
         
         Args:
             text: 文本数据（可以是字符串或字符串列表）
-            protein_sequence: 蛋白质序列（字符串或字符串列表）
+            protein_sequence: 蛋白质序列（字符串或字符串列表）- 必需
             max_length_text: 文本最大长度
             max_length_protein: 蛋白质最大长度
             return_tensors: 返回张量格式
@@ -107,14 +107,16 @@ class ProteinLLMProcessor(ProcessorMixin):
             BatchFeature: 包含处理后的双模态数据
         """
         
+        # 严格双模态要求
+        if text is None or protein_sequence is None:
+            raise ValueError("Both text and protein_sequence must be provided for dual-modal processing")
+        
         # 1. 标准化输入格式
         if isinstance(text, str):
             text = [text]
+        
         if isinstance(protein_sequence, str):
             protein_sequence = [protein_sequence]
-        
-        if text is None or protein_sequence is None:
-            raise ValueError("Both text and protein_sequence must be provided")
         
         if len(text) != len(protein_sequence):
             raise ValueError(f"Text and protein sequence counts must match: {len(text)} vs {len(protein_sequence)}")

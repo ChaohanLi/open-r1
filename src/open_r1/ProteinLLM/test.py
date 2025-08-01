@@ -138,24 +138,87 @@ def test_datacollator_with_processor():
         return None, None
 
 def test_sft_trainer_integration():
-    """测试SFTTrainer集成"""
-    print("\\n=== 测试SFTTrainer集成 ===")
+    """测试SFTTrainer集成 - 真实版本"""
+    print("\\n=== 测试SFTTrainer集成 - 真实版本 ===")
     
-    # 这里可以测试真实的SFTTrainer集成
-    # 但为了避免下载大模型，我们先跳过
-    print("SFTTrainer集成测试暂时跳过（避免下载大模型）")
+    try:
+        from trl import SFTTrainer
+        print("✅ 成功导入SFTTrainer")
+    except ImportError:
+        print("❌ 无法导入SFTTrainer，请安装TRL库")
+        return None, None
     
-    # 推荐的配置：
-    print("\\n推荐的SFTTrainer配置：")
-    print("""
-    trainer = SFTTrainer(
-        model=protein_llm_model,           # 自定义模型
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=protein_processor,  # 🔧 传入Processor
-        data_collator=protein_data_collator, # 🔧 传入DataCollator
+    # 1. 创建模型
+    print("创建双模态模型...")
+    config = ProteinLLMConfig(
+        text_model_name="Qwen/Qwen2.5-Math-1.5B",
+        protein_model_name="facebook/esm2_t12_35M_UR50D",
+        text_model_finetune=True,
+        protein_model_finetune=False
     )
-    """)
+    
+    try:
+        model = ProteinLLMModel(config=config)
+        print(f"✅ 模型创建成功")
+        
+        # 2. 创建DataCollator
+        data_collator = ProteinLLMDataCollator(
+            processor=model.processor,
+            max_length_text=512,
+            max_length_protein=100
+        )
+        print(f"✅ DataCollator创建成功")
+        
+        # 3. 准备数据集
+        test_data = load_test_data()
+        dataset = Dataset.from_list(test_data)
+        print(f"✅ 数据集准备完成，共{len(dataset)}个样本")
+        
+        # 4. 配置训练参数
+        training_args = TrainingArguments(
+            output_dir="./test_sft_output",
+            max_steps=5,  # 只训练5步来测试
+            per_device_train_batch_size=1,  # 小batch size避免内存问题
+            learning_rate=1e-5,
+            logging_steps=1,
+            save_steps=10,
+            gradient_checkpointing=False,
+            fp16=False,  # 避免数值问题
+            bf16=False,
+            remove_unused_columns=False,  # 保留protein_sequence列
+            dataloader_drop_last=False,
+            eval_strategy="no",  # 不进行评估
+            save_strategy="no",   # 不保存checkpoint
+        )
+        print(f"✅ 训练参数配置完成")
+        
+        # 5. 创建SFTTrainer - 正确的双模态配置
+        print("创建SFTTrainer...")
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            data_collator=data_collator,        # 🔧 关键：让DataCollator处理所有数据
+            # 🔧 重要：完全禁用SFTTrainer的数据预处理
+            formatting_func=None,              # 不使用formatting函数 - 让DataCollator全权处理
+            # 不传入processing_class，避免SFTTrainer调用Processor
+        )
+        print(f"✅ SFTTrainer创建成功")
+        
+        # 6. 运行训练测试
+        print("开始训练测试（5步）...")
+        train_result = trainer.train()
+        
+        print(f"✅ SFTTrainer训练测试成功！")
+        print(f"训练指标: {train_result.metrics}")
+        
+        return trainer, train_result
+        
+    except Exception as e:
+        print(f"❌ SFTTrainer集成测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 def main():
     """主测试流程"""
@@ -172,10 +235,21 @@ def main():
     if batch is not None:
         print("✅ DataCollator测试通过\\n")
     
-    # 测试SFTTrainer集成
-    test_sft_trainer_integration()
+    # 测试SFTTrainer集成 - 真实版本
+    trainer, train_result = test_sft_trainer_integration()
+    if train_result is not None:
+        print("✅ SFTTrainer集成测试通过\\n")
     
-    print("\\n🎉 架构测试完成！")
+    print("\\n🎉 完整架构测试完成！")
+    
+    # 总结报告
+    print("\\n📊 测试总结:")
+    print(f"- Processor: {'✅ 通过' if processor_result is not None else '❌ 失败'}")
+    print(f"- DataCollator: {'✅ 通过' if batch is not None else '❌ 失败'}")
+    print(f"- SFTTrainer: {'✅ 通过' if train_result is not None else '❌ 失败'}")
+    
+    if all([processor_result is not None, batch is not None, train_result is not None]):
+        print("\\n🏆 所有测试通过！双模态架构准备就绪！")
 
 if __name__ == "__main__":
     main()
