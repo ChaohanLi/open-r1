@@ -19,7 +19,7 @@ class ProteinLLMModel(PreTrainedModel):
     结合文本LLM和蛋白质编码器，专门用于信号肽类型识别任务
     
     Architecture:
-        - Text Model: Qwen2.5 (处理对话和推理)
+        - Text Model: Qwen3 (处理对话和推理)
         - Protein Model: ESM2 (编码蛋白质序列)
         - Projection: 将蛋白质embedding投影到文本空间
         - Fusion: 在文本中替换<|protein_pad|>占位符
@@ -28,7 +28,7 @@ class ProteinLLMModel(PreTrainedModel):
     def __init__(
         self,
         config,
-        text_model_name: str = "Qwen/Qwen2.5-Math-7B",
+        text_model_name: str = "Qwen/Qwen3-1.7B",
         protein_model_name: str = "facebook/esm2_t33_650M_UR50D",
         cache_dir: Optional[str] = None,
         text_model_finetune: bool = True,
@@ -51,7 +51,8 @@ class ProteinLLMModel(PreTrainedModel):
             text_model_name,
             cache_dir=cache_dir,
             trust_remote_code=True,
-            torch_dtype=torch.float16,
+            # 🔧 使用bfloat16平衡精度和显存，数值稳定性好
+            torch_dtype=torch.bfloat16,
             attn_implementation="eager",
             **kwargs
         )
@@ -94,8 +95,16 @@ class ProteinLLMModel(PreTrainedModel):
         # 创建投影层：蛋白质embedding → 文本embedding空间
         self.protein_projection = nn.Linear(
             self.protein_model.config.hidden_size,  # ESM2: 1280
-            self.text_model.config.hidden_size      # Qwen: 4096
+            self.text_model.config.hidden_size      # Qwen3-1.7B: 2048
         )
+        
+        # 🔧 参考BioReason：添加投影层权重初始化，提高数值稳定性
+        with torch.no_grad():
+            # 使用Xavier uniform初始化，减少数值不稳定
+            nn.init.xavier_uniform_(self.protein_projection.weight)
+            # bias初始化为0
+            if self.protein_projection.bias is not None:
+                nn.init.zeros_(self.protein_projection.bias)
         
         # 设置模型的可训练性
         self._set_model_trainability()
@@ -163,7 +172,13 @@ class ProteinLLMModel(PreTrainedModel):
             if protein_embeddings.size(1) > 2:  # 确保序列长度足够
                 protein_embeddings = protein_embeddings[:, 1:-1, :]  # 移除首尾特殊tokens
             
-            # 应用投影层：ESM hidden_size -> Text hidden_size
+            # 🔧 参考BioReason：确保设备和数据类型一致
+            protein_embeddings = protein_embeddings.to(
+                device=self.protein_projection.weight.device,
+                dtype=self.protein_projection.weight.dtype
+            )
+            
+            # 应用投影层：ESM hidden_size -> Text hidden_size  
             protein_embeddings = self.protein_projection(protein_embeddings)
             
             return protein_embeddings
@@ -176,62 +191,35 @@ class ProteinLLMModel(PreTrainedModel):
         batch_idx_map: List[int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        严格的融合逻辑 - 占位符数量必须匹配氨基酸数量
+        🔧 重写：参考BioReason的高效融合方法
+        使用布尔掩码批量替换，避免循环引入的不稳定性
         """
-        batch_size, text_seq_len = input_ids.shape
-        
         # 获取文本embeddings
         text_embeddings = self.text_model.get_input_embeddings()(input_ids)
-        fused_embeddings = text_embeddings.clone()
         
-        # 找到蛋白质占位符位置
-        protein_positions = (input_ids == self.protein_token_id)
+        # 🔧 参考BioReason：确保protein_embeddings与text_embeddings数据类型一致
+        if protein_embeddings is not None:
+            protein_embeddings = protein_embeddings.to(dtype=text_embeddings.dtype)
         
-        if protein_embeddings is not None and protein_positions.any():
-            protein_idx = 0
+            # 找到所有蛋白质占位符位置
+            mask = (input_ids == self.protein_token_id)
+            n_protein_tokens = mask.sum().item()
             
-            for batch_idx in range(batch_size):
-                batch_protein_positions = protein_positions[batch_idx].nonzero(as_tuple=True)[0]
-                
-                if len(batch_protein_positions) > 0:
-                    # 🔧 添加：检查batch_idx_map范围
-                    if protein_idx >= len(batch_idx_map):
-                        raise ValueError(
-                            f"protein_idx ({protein_idx}) exceeds batch_idx_map length ({len(batch_idx_map)}). "
-                            f"This indicates a mismatch between protein sequences and batch samples."
-                        )
-                    
-                    if batch_idx_map[protein_idx] == batch_idx:
-                        # 当前样本的蛋白质embedding
-                        protein_embed = protein_embeddings[protein_idx]  # [actual_protein_seq_len, hidden_size]
-                        
-                        # 计算有效氨基酸数量（已经移除了<cls>和<eos>）
-                        valid_mask = protein_embed.norm(dim=-1) > 0
-                        valid_aa_count = valid_mask.sum().item()
-                        num_placeholders = len(batch_protein_positions)
-                        
-                        # 🔧 严格检查：占位符数量必须等于氨基酸数量
-                        if num_placeholders != valid_aa_count:
-                            raise ValueError(
-                                f"Mismatch in batch {batch_idx}: "
-                                f"Found {num_placeholders} <|protein_pad|> placeholders in text, "
-                                f"but protein has {valid_aa_count} valid amino acids. "
-                                f"Processor should ensure these numbers match exactly.\n"
-                                f"Protein sequence length after removing <cls>/<eos>: {protein_embed.shape[0]}\n"
-                                f"Valid amino acids (non-zero norm): {valid_aa_count}\n"
-                                f"Placeholder positions: {batch_protein_positions.tolist()}"
-                            )
-                        
-                        if valid_aa_count > 0:
-                            valid_aa_embeddings = protein_embed[valid_mask]
-                            
-                            # 🔧 逐个精确替换（数量已经验证匹配）
-                            for i, pos in enumerate(batch_protein_positions):
-                                fused_embeddings[batch_idx, pos] = valid_aa_embeddings[i]
-                        
-                        protein_idx += 1
+            # 扁平化所有蛋白质embeddings
+            protein_embeds_flat = protein_embeddings.view(-1, protein_embeddings.size(-1))
+            n_protein_features = protein_embeds_flat.shape[0]
+            
+            # 🔧 严格检查：确保数量匹配
+            if n_protein_features != n_protein_tokens:
+                raise ValueError(
+                    f"Protein features and protein tokens do not match: "
+                    f"features {n_protein_features}, tokens: {n_protein_tokens}"
+                )
+            
+            # 🔧 参考BioReason：使用布尔掩码批量替换
+            text_embeddings[mask] = protein_embeds_flat
         
-        return fused_embeddings, attention_mask
+        return text_embeddings, attention_mask
     
     def forward(
         self,
@@ -269,6 +257,14 @@ class ProteinLLMModel(PreTrainedModel):
                 protein_embeddings=protein_embeddings,
                 batch_idx_map=batch_idx_map
             )
+            
+            # 🔧 添加数值稳定性检查
+            if torch.isnan(fused_embeddings).any():
+                raise ValueError("NaN detected in fused_embeddings before text_model forward")
+            
+            # 🔧 添加数值范围检查，防止极值
+            if fused_embeddings.abs().max() > 1e6:
+                print(f"Warning: Large values in fused_embeddings: max={fused_embeddings.abs().max()}")
             
             # 使用融合后的embeddings
             outputs = self.text_model(
@@ -353,27 +349,63 @@ class ProteinLLMModel(PreTrainedModel):
         
         return generated_ids
     
+    # 🔧 添加梯度检查点支持方法
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """启用梯度检查点"""
+        if hasattr(self.text_model, 'gradient_checkpointing_enable'):
+            self.text_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+    
+    def gradient_checkpointing_disable(self):
+        """禁用梯度检查点"""
+        if hasattr(self.text_model, 'gradient_checkpointing_disable'):
+            self.text_model.gradient_checkpointing_disable()
+    
+    @property
+    def supports_gradient_checkpointing(self):
+        """检查是否支持梯度检查点"""
+        return hasattr(self.text_model, 'gradient_checkpointing_enable')
+    
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """从预训练模型加载"""
-        # 这里可以实现模型保存和加载逻辑
-        # 目前返回新实例
-        config = kwargs.get('config', None)
-        return cls(config=config, **kwargs)
+        """从SFT检查点加载（本地优先）"""
+        # 1) 读取配置
+        config = ProteinLLMConfig.from_pretrained(pretrained_model_name_or_path)
+        # 2) 文本模型子目录（优先本地）
+        text_model_dir = os.path.join(pretrained_model_name_or_path, "text_model")
+        text_model_name = text_model_dir if os.path.isdir(text_model_dir) else config.text_model_name
+        # 3) 初始化（会从本地 text_model_dir 加载）
+        model = cls(
+            config=config,
+            text_model_name=text_model_name,
+            protein_model_name=config.protein_model_name,
+            **kwargs
+        )
+        # 4) 加载投影层
+        proj_path = os.path.join(pretrained_model_name_or_path, "protein_projection.pth")
+        if os.path.exists(proj_path):
+            state = torch.load(proj_path, map_location="cpu")
+            model.protein_projection.load_state_dict(state)
+        # 5) 覆盖 tokenizer/processor（若已保存）
+        tok_dir = os.path.join(pretrained_model_name_or_path, "text_tokenizer")
+        if os.path.isdir(tok_dir):
+            model.text_tokenizer = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
+        proc_dir = os.path.join(pretrained_model_name_or_path, "processor")
+        if os.path.isdir(proc_dir):
+            model.processor = ProteinLLMProcessor.from_pretrained(proc_dir)
+        return model
     
     def save_pretrained(self, save_directory, **kwargs):
-        """保存模型"""
-        # 保存文本模型
-        self.text_model.save_pretrained(f"{save_directory}/text_model", **kwargs)
-        
-        # 保存投影层
-        torch.save(
-            self.protein_projection.state_dict(), 
-            f"{save_directory}/protein_projection.pth"
-        )
-        
-        # 保存处理器
-        self.processor.save_pretrained(save_directory, **kwargs)
+        """保存模型到本地检查点"""
+        os.makedirs(save_directory, exist_ok=True)
+        # 1) 保存config
+        self.config.save_pretrained(save_directory)
+        # 2) 保存文本模型/分词器
+        self.text_model.save_pretrained(os.path.join(save_directory, "text_model"), **kwargs)
+        self.text_tokenizer.save_pretrained(os.path.join(save_directory, "text_tokenizer"))
+        # 3) 保存投影层
+        torch.save(self.protein_projection.state_dict(), os.path.join(save_directory, "protein_projection.pth"))
+        # 4) 保存处理器
+        self.processor.save_pretrained(os.path.join(save_directory, "processor"), **kwargs)
 
 
 # 用于配置的简单config类
@@ -384,7 +416,7 @@ class ProteinLLMConfig(PretrainedConfig):
     
     def __init__(
         self,
-        text_model_name: str = "Qwen/Qwen2.5-Math-7B",
+        text_model_name: str = "Qwen/Qwen3-1.7B",
         protein_model_name: str = "facebook/esm2_t33_650M_UR50D",
         text_model_finetune: bool = True,
         protein_model_finetune: bool = False,

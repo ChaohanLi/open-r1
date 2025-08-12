@@ -89,7 +89,7 @@ class ProteinLLMProcessor(ProcessorMixin):
         text: Union[str, List[str]] = None,
         protein_sequence: Union[str, List[str]] = None,
         max_length_text: int = 1024,
-        max_length_protein: int = 128,
+        max_length_protein: int = 72,
         return_tensors: Optional[str] = None,
         **kwargs,
     ) -> BatchFeature:
@@ -139,6 +139,7 @@ class ProteinLLMProcessor(ProcessorMixin):
         processed_texts = []
         for i, txt in enumerate(text):
             if self.protein_token in txt:
+                print(f"Sample text length: {len(txt)}")
                 # 计算该样本的实际氨基酸token数
                 attention_mask = protein_tokenized['attention_mask'][i]
                 total_tokens = attention_mask.sum().item()
@@ -150,6 +151,7 @@ class ProteinLLMProcessor(ProcessorMixin):
                     self.protein_token, 
                     self.protein_token * amino_acid_count
                 )
+                print(f"Sample text length: {len(expanded_text)}")
                 processed_texts.append(expanded_text)
                 
                 print(f"Sample {i}: {total_tokens} total tokens → {amino_acid_count} amino acid placeholders")
@@ -171,10 +173,7 @@ class ProteinLLMProcessor(ProcessorMixin):
             # 文本tokenization结果
             **text_tokenized,
             # 蛋白质tokenization结果
-            "protein_tokenized": {
-                "input_ids": protein_tokenized["input_ids"],
-                "attention_mask": protein_tokenized["attention_mask"],
-            },
+            "protein_tokenized": protein_tokenized,
             # 简化的批次映射
             "batch_idx_map": list(range(batch_size)),
         }
