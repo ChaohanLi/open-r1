@@ -43,6 +43,8 @@ def main(script_args, training_args, model_args):
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
 
     logger.info(f"Protein Model parameters {model_args}")
     logger.info(f"Script parameters {script_args}")
